@@ -12,9 +12,8 @@ os.chdir(BASE_DIR)
 CONFIG_FILE = os.path.join(BASE_DIR, "dual_settings.json")
 HTML_FILE = os.path.join(BASE_DIR, "index.html")
 
-# We use a Lock to ensure only one light is being talked to at a exact millisecond
-hardware_lock = threading.Lock()
-latest_states, cmd_queue = {}, queue.Queue()
+# Global storage for per-light queues and threads
+light_workers = {}
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads, allow_reuse_address = True, True
@@ -53,36 +52,45 @@ def build_pkt(cmd, val=0, rgb=None):
     pkt.extend([chk, 0x00])
     return pkt
 
-def worker():
+def light_worker_thread(ip, q):
+    """Dedicated thread for a single light IP."""
     while True:
-        tid = cmd_queue.get()
-        l = latest_states.get(tid)
-        if not l or 'ip' not in l: 
-            cmd_queue.task_done(); continue
-        
-        # Use the lock to prevent overlapping socket connections
-        with hardware_lock:
-            try:
-                m_b = min(l['b'], 15) if l['con'] else l['b']
-                main_v, chr_v = (m_b * 2.55) if l['on'] else 0, (l['cb'] * 2.55) if l['con'] else 0
-                rgb = tuple(int(l['chx'].lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
-                
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(1.5) # Increased timeout for reliability
-                    s.connect((l['ip'], RAZER_PORT))
-                    s.sendall(bytearray.fromhex("aa000013020912022026010900110000401500")); s.recv(64)
-                    s.sendall(build_pkt("REG")); s.recv(64)
-                    s.sendall(build_pkt("BRIGHT", main_v)); time.sleep(0.06) # Slightly longer breathers
-                    s.sendall(build_pkt("TEMP", l.get('t', 5000))); time.sleep(0.06)
-                    s.sendall(build_pkt("C_BRIGHT", chr_v)); time.sleep(0.06)
-                    s.sendall(build_pkt("C_RGB", rgb=rgb))
-                    time.sleep(0.1) # Cool-down period for the hardware
-            except: pass
+        state = q.get()
+        if state is None: break # Shutdown signal
+        try:
+            m_b = min(state['b'], 15) if state['con'] else state['b']
+            main_v, chr_v = (m_b * 2.55) if state['on'] else 0, (state['cb'] * 2.55) if state['con'] else 0
+            rgb = tuple(int(state['chx'].lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
             
-        cmd_queue.task_done()
-        time.sleep(0.05)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1.2)
+                s.connect((ip, RAZER_PORT))
+                s.sendall(bytearray.fromhex("aa000013020912022026010900110000401500")); s.recv(64)
+                s.sendall(build_pkt("REG")); s.recv(64)
+                s.sendall(build_pkt("BRIGHT", main_v)); time.sleep(0.04)
+                s.sendall(build_pkt("TEMP", state.get('t', 5000))); time.sleep(0.04)
+                s.sendall(build_pkt("C_BRIGHT", chr_v)); time.sleep(0.04)
+                s.sendall(build_pkt("C_RGB", rgb=rgb))
+        except: pass
+        q.task_done()
+        time.sleep(0.02) # Small internal cooldown for this specific light
 
-threading.Thread(target=worker, daemon=True).start()
+def dispatch(light_id, state):
+    """Send a state update to the correct light worker."""
+    ip = state.get('ip')
+    if not ip: return
+    if ip not in light_workers:
+        q = queue.Queue()
+        t = threading.Thread(target=light_worker_thread, args=(ip, q), daemon=True)
+        t.start()
+        light_workers[ip] = q
+    
+    # Clear the queue of old pending actions for this specific light so it's snappy
+    while not light_workers[ip].empty():
+        try: light_workers[ip].get_nowait(); light_workers[ip].task_done()
+        except queue.Empty: break
+    
+    light_workers[ip].put(state)
 
 class Server(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -143,11 +151,11 @@ class Server(BaseHTTPRequestHandler):
             self.wfile.write(template.replace("{{CONTENT}}", content).encode())
 
         elif p.path == '/set':
-            tid = q['id'][0]; l = mem["lights"][tid]; ic = q['cpwr'][0]=='true' if 'cpwr' in q else l['con']
+            tid = q['id'][0]; l = mem["lights"][tid]; ic = q['cpwr'][0]=='true' if 'cpwr' in q else l.get('con', False)
             l.update({"b": min(int(q['b'][0]), 15) if ic else int(q['b'][0]), "t":int(q['t'][0]), "cb":int(q['cb'][0]), "chx":"#"+q['hex'][0]})
             if 'pwr' in q: l['on'] = q['pwr'][0] == 'true'
             if 'cpwr' in q: l['con'] = q['cpwr'][0] == 'true'
-            save_mem(mem); latest_states[tid] = l.copy(); cmd_queue.put(tid); self.send_response(200); self.end_headers()
+            save_mem(mem); dispatch(tid, l.copy()); self.send_response(200); self.end_headers()
         elif p.path == '/add_preset':
             n = q.get('name',[''])[0].strip().replace(' ','_') or f"Scene_{len(mem['presets'])+1}"; mem["presets"][n] = {lid: {k:v for k,v in l.items() if k not in ['ip','name','order']} for lid,l in mem["lights"].items()}; save_mem(mem); self.redirect()
         elif p.path == '/apply_preset':
@@ -155,7 +163,7 @@ class Server(BaseHTTPRequestHandler):
             if n in mem["presets"]:
                 for lid, s in mem["presets"][n].items():
                     if lid in mem["lights"]: 
-                        mem["lights"][lid].update(s); latest_states[lid]=mem["lights"][lid].copy(); cmd_queue.put(lid)
+                        mem["lights"][lid].update(s); dispatch(lid, mem["lights"][lid].copy())
                 save_mem(mem)
             self.redirect()
         elif p.path == '/del_preset':
@@ -170,7 +178,7 @@ class Server(BaseHTTPRequestHandler):
         elif p.path == '/add':
             tid = str(int(time.time()))
             mem["lights"][tid] = {"name":q.get('n',[''])[0] or f"L{len(mem['lights'])+1}","ip":q.get('ip',[''])[0],"b":50,"t":5000,"on":True,"cb":50,"chx":"#00ff41","con":False,"order":len(mem['lights'])}
-            latest_states[tid] = mem["lights"][tid].copy(); save_mem(mem); self.redirect()
+            dispatch(tid, mem["lights"][tid].copy()); save_mem(mem); self.redirect()
         elif p.path == '/kill': os._exit(0)
 
     def redirect(self): self.send_response(302); self.send_header('Location','/'); self.end_headers()
