@@ -1,4 +1,4 @@
-# 💡 Razer Key Light Chroma - Studio Master (V1.0)
+# 💡 Simple Razer Keylight Chroma Controller (V1.0)
 
 A lightweight, high-performance Python controller designed specifically for the **Razer Key Light Chroma**. This tool replaces Razer Synapse with a fast, web-based dashboard and seamless Stream Deck integration.
 
