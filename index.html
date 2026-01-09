@@ -1,0 +1,50 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Razer Master V5.0</title>
+<style>
+    body { background: #080808; color: #00ff41; font-family: 'Segoe UI', sans-serif; display: flex; flex-direction: column; align-items: center; padding: 20px; }
+    .lights-container { display: flex; justify-content: center; gap: 20px; flex-wrap: wrap; width: 100%; margin-bottom: 30px; }
+    .box { background: #141414; padding: 20px; border-radius: 16px; border: 1px solid #222; width: 320px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    .chroma-area { margin-top: 5px; padding-top: 10px; border-top: 1px dashed #444; }
+    .section-label { font-size: 9px; color: #666; letter-spacing: 1px; margin-bottom: 8px; display: block; text-transform: uppercase; }
+    input[type=range] { width: 100%; accent-color: #00ff41; margin: 8px 0; cursor: pointer; }
+    .btn-group { display: flex; gap: 6px; margin: 8px 0 12px 0; }
+    button { padding: 10px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 10px; flex: 1; text-transform: uppercase; }
+    .active-on, .active-chroma-on { background: #00ff41 !important; color: #000 !important; }
+    .active-off { background: #ff4141 !important; color: #fff !important; }
+    .is-off .ctrl-main, .is-chroma-off .ctrl-chroma { opacity: 0.15; pointer-events: none; filter: grayscale(1); }
+    .rgb-row { display: flex; gap: 10px; align-items: stretch; margin-top: 10px; }
+    .rgb-sliders { flex: 1; display: flex; flex-direction: column; gap: 4px; background: #000; padding: 10px; border-radius: 8px; border: 1px solid #333; }
+    .swatch { width: 30px; border-radius: 6px; border: 1px solid #444; }
+    .preset-container { background: #111; border: 1px solid #222; border-radius: 12px; padding: 15px; width: 100%; max-width: 1050px; }
+    .preset-card { background: #181818; padding: 10px; border-radius: 8px; margin-bottom: 6px; display: flex; align-items: center; gap: 15px; border: 1px solid #222; }
+    .badge { background: #000; padding: 4px 8px; border-radius: 4px; border: 1px solid #333; display: inline-flex; align-items: center; gap: 8px; font-size: 10px; margin-right: 5px; }
+    .diode { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
+    .on { background: #00ff41; box-shadow: 0 0 5px #00ff41; }
+    .off { background: #ff4141; }
+    .setup-area { margin-top: 40px; opacity: 0.3; width: 600px; transition: 0.3s; }
+    .setup-area:hover { opacity: 1; }
+    input[type=text] { background: #000; color: #fff; border: 1px solid #333; padding: 10px; border-radius: 4px; }
+</style>
+<script>
+    function rgbToHex(r, g, b) { return "#" + ((1 << 24) + (r << 16) + (g << 8) + (b << 0)).toString(16).slice(1); }
+    function updateUI(id, isC) {
+        let bS = document.getElementById('b'+id), bV = document.getElementById('bv'+id);
+        if(isC && bS.value > 15) { bS.value = 15; bV.style.color = '#f44'; } else { bV.style.color = ''; }
+        bV.innerText = bS.value + '%';
+        document.getElementById('tv'+id).innerText = document.getElementById('t'+id).value + "K";
+        let r = parseInt(document.getElementById('r'+id).value), g = parseInt(document.getElementById('g'+id).value), bl = parseInt(document.getElementById('bl'+id).value);
+        document.getElementById('swatch'+id).style.background = rgbToHex(r, g, bl);
+        document.getElementById('cbv'+id).innerText = document.getElementById('cb'+id).value+'%';
+    }
+    function transmit(id, type, pwr=null) {
+        let h = rgbToHex(parseInt(document.getElementById('r'+id).value), parseInt(document.getElementById('g'+id).value), parseInt(document.getElementById('bl'+id).value)).replace('#','');
+        let url = `/set?id=${id}&b=${document.getElementById('b'+id).value}&t=${document.getElementById('t'+id).value}&cb=${document.getElementById('cb'+id).value}&hex=${h}`;
+        if(pwr!==null) url += (type==='main' ? '&pwr=' : '&cpwr=') + pwr;
+        fetch(url).then(() => { if(pwr!==null) location.reload(); });
+    }
+    function copyUrl(name) {
+        let u = "http://127.0.0.1:8000/apply_preset?name=" + encodeURIComponent(name);
+        navigator.clipboard.writeText(u);
+    }
+</script></head><body>
+    {{CONTENT}}
+</body></html>
