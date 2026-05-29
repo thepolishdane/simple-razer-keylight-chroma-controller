@@ -1,0 +1,10 @@
+# Local device database (your light IPs + saved scenes)
+dual_settings.json
+dual_settings.json.tmp
+
+# Runtime log
+razer_controller.log
+
+# Python
+__pycache__/
+*.pyc

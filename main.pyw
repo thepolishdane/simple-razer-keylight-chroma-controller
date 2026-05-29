@@ -1,44 +1,76 @@
-import socket, time, os, threading, json, queue
+import socket, time, os, sys, threading, json, queue, logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 
 # --- CONFIG ---
 PORT = 8000
+HOST = "127.0.0.1"          # local-only: dashboard + Stream Deck both hit 127.0.0.1
 RAZER_PORT = 10003
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-os.chdir(BASE_DIR) 
+os.chdir(BASE_DIR)
 
 CONFIG_FILE = os.path.join(BASE_DIR, "dual_settings.json")
 HTML_FILE = os.path.join(BASE_DIR, "index.html")
+LOG_FILE = os.path.join(BASE_DIR, "razer_controller.log")
+
+logging.basicConfig(
+    filename=LOG_FILE, level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("razer")
+
+# Serializes all config reads/writes so rapid Stream Deck presses can't
+# interleave a load->mutate->save and clobber each other (lost update).
+CONFIG_LOCK = threading.RLock()
 
 # Global storage for per-light queues and threads
 light_workers = {}
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads, allow_reuse_address = True, True
+    daemon_threads = True
+    # NOT allow_reuse_address: we WANT a second instance to fail to bind so it
+    # can't run as a silent duplicate fighting over the same port.
+    allow_reuse_address = False
+
+def already_running():
+    """True if another instance already owns the control port."""
+    try:
+        with socket.create_connection((HOST, PORT), timeout=0.5):
+            return True
+    except OSError:
+        return False
 
 def load_mem():
-    data = {"lights": {}, "presets": {}}
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                data = json.load(f)
+    with CONFIG_LOCK:
+        data = {"lights": {}, "presets": {}}
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    data = json.load(f)
                 for lid in data.get("lights", {}):
                     l = data["lights"][lid]
                     for k, v in [("b", 50), ("t", 5000), ("cb", 50), ("chx", "#00ff41"), ("con", False), ("on", True), ("order", 0)]:
                         if k not in l: l[k] = v
                 return data
-        except: pass
-    return data
+            except Exception:
+                log.exception("Failed to load config; falling back to empty.")
+        return data
 
 def save_mem(data):
-    try:
-        with open(CONFIG_FILE, "w") as f: json.dump(data, f, indent=4)
-    except: pass
+    with CONFIG_LOCK:
+        try:
+            # Atomic write: never leave a half-written config if killed mid-save.
+            tmp = CONFIG_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=4)
+            os.replace(tmp, CONFIG_FILE)
+        except Exception:
+            log.exception("Failed to save config.")
 
 def build_pkt(cmd, val=0, rgb=None):
     h = bytearray.fromhex("aa00005f000000000000")
+    p = bytearray()
     if cmd == "REG": p = bytearray.fromhex("48004901d45d645125220853796e6170736533")
     elif cmd == "BRIGHT": p = bytearray.fromhex(f"0303030020{int(val):02x}")
     elif cmd == "TEMP": p = bytearray.fromhex(f"0403010020{int(val):04x}")
@@ -52,28 +84,45 @@ def build_pkt(cmd, val=0, rgb=None):
     pkt.extend([chk, 0x00])
     return pkt
 
+def _send_state(ip, state):
+    """Open one socket and push the full command set. Raises on any failure."""
+    m_b = min(state['b'], 15) if state['con'] else state['b']
+    main_v = (m_b * 2.55) if state['on'] else 0
+    chr_v = (state['cb'] * 2.55) if state['con'] else 0
+    rgb = tuple(int(state['chx'].lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(2.0)
+        s.connect((ip, RAZER_PORT))
+        s.sendall(bytearray.fromhex("aa000013020912022026010900110000401500")); s.recv(64)
+        s.sendall(build_pkt("REG")); s.recv(64)
+        s.sendall(build_pkt("BRIGHT", main_v)); time.sleep(0.05)
+        s.sendall(build_pkt("TEMP", state.get('t', 5000))); time.sleep(0.05)
+        s.sendall(build_pkt("C_BRIGHT", chr_v)); time.sleep(0.05)
+        s.sendall(build_pkt("C_RGB", rgb=rgb)); time.sleep(0.05)
+
 def light_worker_thread(ip, q):
     """Dedicated thread for a single light IP."""
     while True:
         state = q.get()
-        if state is None: break # Shutdown signal
-        try:
-            m_b = min(state['b'], 15) if state['con'] else state['b']
-            main_v, chr_v = (m_b * 2.55) if state['on'] else 0, (state['cb'] * 2.55) if state['con'] else 0
-            rgb = tuple(int(state['chx'].lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
-            
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1.2)
-                s.connect((ip, RAZER_PORT))
-                s.sendall(bytearray.fromhex("aa000013020912022026010900110000401500")); s.recv(64)
-                s.sendall(build_pkt("REG")); s.recv(64)
-                s.sendall(build_pkt("BRIGHT", main_v)); time.sleep(0.04)
-                s.sendall(build_pkt("TEMP", state.get('t', 5000))); time.sleep(0.04)
-                s.sendall(build_pkt("C_BRIGHT", chr_v)); time.sleep(0.04)
-                s.sendall(build_pkt("C_RGB", rgb=rgb))
-        except: pass
+        if state is None: break  # Shutdown signal
+        # Retry: a WiFi keylight that has dropped into low-power sleep ignores
+        # the first connection (and pings) but the attempt wakes its radio.
+        # Without this the first button press silently does nothing and the
+        # user has to press again -- the "not always responsive" bug.
+        last_err = None
+        for attempt in range(3):
+            try:
+                _send_state(ip, state)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(0.2)
+        if last_err is not None:
+            log.warning("Light %s unreachable after 3 attempts: %s", ip, last_err)
         q.task_done()
-        time.sleep(0.02) # Small internal cooldown for this specific light
+        time.sleep(0.02)  # Small internal cooldown for this specific light
 
 def dispatch(light_id, state):
     """Send a state update to the correct light worker."""
@@ -84,16 +133,29 @@ def dispatch(light_id, state):
         t = threading.Thread(target=light_worker_thread, args=(ip, q), daemon=True)
         t.start()
         light_workers[ip] = q
-    
+
     # Clear the queue of old pending actions for this specific light so it's snappy
     while not light_workers[ip].empty():
         try: light_workers[ip].get_nowait(); light_workers[ip].task_done()
         except queue.Empty: break
-    
+
     light_workers[ip].put(state)
 
 class Server(BaseHTTPRequestHandler):
     def do_GET(self):
+        # One lock for the whole request: serializes config access, and a bad
+        # query param logs + returns 500 instead of silently killing the thread.
+        try:
+            with CONFIG_LOCK:
+                self.handle_request()
+        except Exception:
+            log.exception("Request failed: %s", self.path)
+            try:
+                self.send_response(500); self.end_headers()
+            except Exception:
+                pass
+
+    def handle_request(self):
         mem = load_mem(); p = urlparse(self.path); q = parse_qs(p.query)
         if p.path == '/':
             self.send_response(200); self.send_header("Content-type", "text/html"); self.end_headers()
@@ -162,7 +224,7 @@ class Server(BaseHTTPRequestHandler):
             n = q.get('name',[''])[0]
             if n in mem["presets"]:
                 for lid, s in mem["presets"][n].items():
-                    if lid in mem["lights"]: 
+                    if lid in mem["lights"]:
                         mem["lights"][lid].update(s); dispatch(lid, mem["lights"][lid].copy())
                 save_mem(mem)
             self.redirect()
@@ -180,9 +242,23 @@ class Server(BaseHTTPRequestHandler):
             mem["lights"][tid] = {"name":q.get('n',[''])[0] or f"L{len(mem['lights'])+1}","ip":q.get('ip',[''])[0],"b":50,"t":5000,"on":True,"cb":50,"chx":"#00ff41","con":False,"order":len(mem['lights'])}
             dispatch(tid, mem["lights"][tid].copy()); save_mem(mem); self.redirect()
         elif p.path == '/kill': os._exit(0)
+        else:
+            self.send_response(404); self.end_headers()
 
     def redirect(self): self.send_response(302); self.send_header('Location','/'); self.end_headers()
     def log_message(self, format, *args): return
 
 if __name__ == '__main__':
-    ThreadedHTTPServer(('0.0.0.0', PORT), Server).serve_forever()
+    # Single-instance guard: if another copy already owns the port, quietly exit.
+    # Stops a double-launch (or a login while an old copy lingers) from leaving
+    # two servers fighting over the same lights.
+    if already_running():
+        log.info("Another instance already owns %s:%s -- exiting this one.", HOST, PORT)
+        sys.exit(0)
+    try:
+        server = ThreadedHTTPServer((HOST, PORT), Server)
+    except OSError as e:
+        log.error("Could not bind %s:%s (%s) -- assuming another instance. Exiting.", HOST, PORT, e)
+        sys.exit(0)
+    log.info("Razer controller started on http://%s:%s", HOST, PORT)
+    server.serve_forever()

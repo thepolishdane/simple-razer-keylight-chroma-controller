@@ -48,8 +48,21 @@ A professional-grade, lightweight, and background-running controller for Razer K
 ### ⚠️ Troubleshooting
 
 * **White Screen on Load:** Ensure `index.html` is in the same folder as `main.pyw`.
-* **Lights Not Responding:** Check the IP Management section at the bottom of the dashboard to ensure the IPs match your devices.
+* **Lights Not Responding:** Check the IP Management section at the bottom of the dashboard to ensure the IPs match your devices. A WiFi keylight that has gone to sleep can ignore the first command; the engine now retries automatically, so a single press should wake it.
 * **Port Conflict:** If port `8000` is used by another app, change the `PORT` variable at the top of `main.pyw`.
+* **Check the log:** `razer_controller.log` (next to `main.pyw`) records unreachable lights, config errors, and duplicate-launch exits.
+
+---
+
+### 📝 Changelog
+
+**v5.1**
+* **Single-instance guard.** The engine now refuses to start a second copy. A double-launch (or a login while an old copy lingered) used to leave two servers fighting over the same port, causing intermittent button failures.
+* **Auto-retry on sleeping lights.** A keylight in low-power sleep drops the first connection. The worker now retries up to 3x, so the first button press wakes it instead of doing nothing.
+* **Error logging.** Failures are written to `razer_controller.log` instead of being silently swallowed.
+* **Crash-safe config.** Settings are saved atomically and config access is locked, so rapid presses can't corrupt or clobber `dual_settings.json`.
+* **Local-only binding.** The control server binds to `127.0.0.1` instead of every network interface.
+* **Self-locating launcher.** `Silence.vbs` resolves its own folder, so the Startup shortcut works regardless of the working directory.
 
 ---
 *Created with Google Gemini and ThePolishDane
