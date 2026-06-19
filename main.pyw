@@ -27,6 +27,15 @@ CONFIG_LOCK = threading.RLock()
 # Global storage for per-light queues and threads
 light_workers = {}
 
+# Heartbeat: touch every light on this interval so its WiFi radio never drops
+# into low-power sleep. A sleeping radio ignores the first connection, which is
+# the root cause of "the light sometimes stops reacting / won't turn off".
+# Keep this comfortably below the light's idle-sleep timeout (~60s observed).
+HEARTBEAT_INTERVAL = 30  # seconds
+# Per-attempt backoff for waking a sleeping light. A deep-asleep radio needs a
+# few seconds to come up, so the gaps widen instead of three quick 0.2s tries.
+RETRY_BACKOFF = (0.3, 0.6, 1.0, 1.5)  # len+1 == total attempts
+
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     # NOT allow_reuse_address: we WANT a second instance to fail to bind so it
@@ -111,18 +120,47 @@ def light_worker_thread(ip, q):
         # Without this the first button press silently does nothing and the
         # user has to press again -- the "not always responsive" bug.
         last_err = None
-        for attempt in range(3):
+        for attempt in range(len(RETRY_BACKOFF) + 1):
             try:
                 _send_state(ip, state)
                 last_err = None
                 break
             except Exception as e:
                 last_err = e
-                time.sleep(0.2)
+                if attempt < len(RETRY_BACKOFF):
+                    time.sleep(RETRY_BACKOFF[attempt])
         if last_err is not None:
-            log.warning("Light %s unreachable after 3 attempts: %s", ip, last_err)
+            log.warning("Light %s unreachable after %d attempts: %s",
+                        ip, len(RETRY_BACKOFF) + 1, last_err)
         q.task_done()
         time.sleep(0.02)  # Small internal cooldown for this specific light
+
+def _poke(ip):
+    """Gentle keep-warm on the control port. We complete a proper hello exchange
+    (connect -> send the standard hello packet -> read the reply -> clean close)
+    rather than a bare connect-and-drop: an abrupt half-open connection can wedge
+    a fragile light's single-connection control server. Sends no state commands,
+    so it never changes the light. Matches the handshake monitor_lights.py uses."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(2.0)
+            s.connect((ip, RAZER_PORT))
+            s.sendall(bytearray.fromhex("aa000013020912022026010900110000401500"))
+            s.recv(64)
+        return True
+    except Exception:
+        return False
+
+def heartbeat_thread():
+    """Keep every configured light's radio awake on a fixed interval."""
+    while True:
+        time.sleep(HEARTBEAT_INTERVAL)
+        try:
+            for l in load_mem().get("lights", {}).values():
+                ip = l.get("ip")
+                if ip: _poke(ip)
+        except Exception:
+            log.exception("Heartbeat cycle failed")
 
 def dispatch(light_id, state):
     """Send a state update to the correct light worker."""
@@ -261,4 +299,6 @@ if __name__ == '__main__':
         log.error("Could not bind %s:%s (%s) -- assuming another instance. Exiting.", HOST, PORT, e)
         sys.exit(0)
     log.info("Razer controller started on http://%s:%s", HOST, PORT)
+    threading.Thread(target=heartbeat_thread, daemon=True).start()
+    log.info("Heartbeat keep-alive running every %ss", HEARTBEAT_INTERVAL)
     server.serve_forever()
